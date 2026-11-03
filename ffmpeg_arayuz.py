@@ -34,6 +34,10 @@ from tkinter import filedialog, messagebox, ttk
 S = {
     "title": ("FFmpeg Arayüzü", "FFmpeg GUI"),
     "lang": ("Dil / Language:", "Dil / Language:"),
+    "theme": ("Tema:", "Theme:"),
+    "tok_theme_auto": ("Otomatik (sistem)", "Auto (system)"),
+    "tok_theme_light": ("Açık", "Light"),
+    "tok_theme_dark": ("Koyu", "Dark"),
     "file": ("Video dosyası:", "Video file:"),
     "browse": ("Gözat…", "Browse…"),
     "info_frame": ("Video Bilgileri", "Video Information"),
@@ -529,6 +533,88 @@ def no_window_flags():
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+THEME_TOKENS = {"auto": "tok_theme_auto", "light": "tok_theme_light", "dark": "tok_theme_dark"}
+
+THEMES = {
+    "light": dict(bg="#f0f0f0", fg="#1a1a1a", field="#ffffff", btn="#e1e1e1", btn_hover="#d2d2d2",
+                  border="#b0b0b0", sel="#3b82f6", sel_fg="#ffffff", dis="#9a9a9a", hint="#6b7280",
+                  accent="#2563eb", warn="#b45309", trough="#dcdcdc", text_bg="#ffffff", tab="#e6e6e6"),
+    "dark": dict(bg="#1f2023", fg="#e8e8e8", field="#2b2d31", btn="#35383d", btn_hover="#444850",
+                 border="#4a4d52", sel="#2f6fdb", sel_fg="#ffffff", dis="#767b82", hint="#9aa0a8",
+                 accent="#6cb0ff", warn="#f5a524", trough="#26282b", text_bg="#18191b", tab="#2a2c30"),
+}
+
+
+def config_path():
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "FFmpegArayuz", "config.json")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "ffmpeg_arayuz", "config.json")
+
+
+def load_config():
+    try:
+        with open(config_path(), encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(update):
+    try:
+        cfg = load_config()
+        cfg.update(update)
+        path = config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+def _run_quiet(cmd):
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=2, creationflags=no_window_flags())
+        return (r.stdout or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def detect_system_theme():
+    """İşletim sisteminin açık/koyu temasını döndürür: 'light' veya 'dark'."""
+    try:
+        if os.name == "nt":
+            import winreg
+            key = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+                val, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+            return "light" if val else "dark"
+        if sys.platform == "darwin":
+            return "dark" if "dark" in _run_quiet(["defaults", "read", "-g", "AppleInterfaceStyle"]) else "light"
+        # Linux (GNOME / GTK / KDE)
+        scheme = _run_quiet(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"])
+        if "dark" in scheme:
+            return "dark"
+        if "light" in scheme:
+            return "light"
+        if "dark" in _run_quiet(["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"]):
+            return "dark"
+        if "dark" in os.environ.get("GTK_THEME", "").lower():
+            return "dark"
+        kde = os.path.join(os.path.expanduser("~"), ".config", "kdeglobals")
+        if os.path.isfile(kde):
+            with open(kde, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.strip().lower().startswith("colorscheme="):
+                        return "dark" if "dark" in line.lower() else "light"
+    except Exception:
+        pass
+    return "light"
+
+
 class ValidationError(ValueError):
     """Kullanıcıya gösterilecek (zaten çevrilmiş) ayar hatası."""
 
@@ -605,7 +691,9 @@ class App(tk.Tk):
         self.geometry("1240x940")
         self.minsize(1000, 740)
 
+        self.style = ttk.Style(self)
         self.vars = {}
+        self.current_theme = "light"
         self.lang_var = tk.StringVar(value="Türkçe")
         self.status = tk.StringVar()
         self.status_rec = ("ready", ())
@@ -633,6 +721,8 @@ class App(tk.Tk):
         self.gpu_auto = "off"
         self.gpu_testing = False
 
+        saved_mode = load_config().get("theme_mode", "auto")
+        self.var("theme_mode", saved_mode if saved_mode in ("auto", "light", "dark") else "auto")
         self.var("ffmpeg_path", find_tool("ffmpeg"))
         self.var("ffprobe_path", find_tool("ffprobe"))
 
@@ -643,6 +733,7 @@ class App(tk.Tk):
         self.update_preview()
         self.start_gpu_detect()
         self.after(100, self._poll)
+        self.after(3000, self._theme_tick)
 
         fp = self.g("ffmpeg_path")
         if not (shutil.which(fp) or os.path.isfile(fp)):
@@ -723,7 +814,7 @@ class App(tk.Tk):
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
         widget.grid(row=r, column=1, sticky="ew", pady=3)
         if hint:
-            ttk.Label(parent, text=hint, foreground="gray").grid(row=r, column=2, sticky="w", padx=8)
+            ttk.Label(parent, text=hint, style="Hint.TLabel").grid(row=r, column=2, sticky="w", padx=8)
         return widget
 
     def cc(self, parent, key, default, codes, labeler=None, editable=False, width=30, on_change=None):
@@ -747,12 +838,6 @@ class App(tk.Tk):
         return f
 
     def _build_ui(self):
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam" if os.name != "nt" else "vista")
-        except tk.TclError:
-            pass
-
         mono = "Consolas" if os.name == "nt" else "monospace"
 
         top = ttk.Frame(self, padding=(10, 10, 10, 4))
@@ -762,7 +847,10 @@ class App(tk.Tk):
         e.pack(side="left", fill="x", expand=True, padx=8)
         e.bind("<Return>", lambda ev: self.load_file(self.g("in_path")))
         ttk.Button(top, text=self.t("browse"), command=self.browse_input).pack(side="left")
-        ttk.Label(top, text=self.t("lang")).pack(side="left", padx=(20, 4))
+        ttk.Label(top, text=self.t("theme")).pack(side="left", padx=(20, 4))
+        self.cc(top, "theme_mode", "auto", ["auto", "light", "dark"], labeler=self.mk_lab(THEME_TOKENS),
+                width=16, on_change=self.on_theme_change).pack(side="left")
+        ttk.Label(top, text=self.t("lang")).pack(side="left", padx=(14, 4))
         lc = ttk.Combobox(top, textvariable=self.lang_var, values=["Türkçe", "English"],
                           state="readonly", width=9)
         lc.pack(side="left")
@@ -808,7 +896,7 @@ class App(tk.Tk):
         pf.pack(fill="x", pady=4)
         self.preview = tk.Text(pf, height=4, wrap="word", state="disabled", font=(mono, 9))
         self.preview.pack(fill="x")
-        ttk.Label(pf, textvariable=self.eff_var, foreground="#2563eb").pack(anchor="w", pady=(4, 0))
+        ttk.Label(pf, textvariable=self.eff_var, style="Accent.TLabel").pack(anchor="w", pady=(4, 0))
 
         prow = ttk.Frame(bottom)
         prow.pack(fill="x", pady=2)
@@ -832,6 +920,7 @@ class App(tk.Tk):
         self.btn_cancel.pack(side="left", padx=6)
         ttk.Button(brow, text=self.t("copy_cmd"), command=self.copy_cmd).pack(side="left")
         ttk.Button(brow, text=self.t("open_dir"), command=self.open_out_dir).pack(side="left", padx=6)
+        self.apply_theme()
 
     def _build_video_tab(self, nb):
         t = self.tab(nb, "tab_video")
@@ -853,7 +942,7 @@ class App(tk.Tk):
         self.cb_tune = self.row(t, self.t("tune"), self.cc(t, "tune", "default", ["default"]))
         self.cb_profile = self.row(t, self.t("profile"), self.cc(t, "profile", "default", ["default"]))
         self.row(t, self.t("pix_fmt"), self.cc(t, "pix_fmt", "orig", PIX_FMTS, editable=True))
-        self.copy_hint = ttk.Label(t, text="", foreground="#b45309", wraplength=440, justify="left")
+        self.copy_hint = ttk.Label(t, text="", style="Warn.TLabel", wraplength=440, justify="left")
         self.copy_hint.grid(row=t.grid_size()[1], column=0, columnspan=3, sticky="w", pady=(10, 0))
         self.update_rate_state()
 
@@ -867,7 +956,7 @@ class App(tk.Tk):
         self.res_w.pack(side="left")
         ttk.Label(f, text=" x ").pack(side="left")
         self.res_h.pack(side="left")
-        ttk.Label(f, text=self.t("auto_blank"), foreground="gray").pack(side="left")
+        ttk.Label(f, text=self.t("auto_blank"), style="Hint.TLabel").pack(side="left")
         self.row(t, self.t("custom_res"), f)
         self.update_res_state()
 
@@ -914,7 +1003,7 @@ class App(tk.Tk):
         f = ttk.Frame(t)
         self.chk(f, "loudnorm", self.t("loudnorm")).pack(side="left")
         self.row(t, self.t("normalize"), f)
-        ttk.Label(t, text=self.t("audio_note"), foreground="gray").grid(
+        ttk.Label(t, text=self.t("audio_note"), style="Hint.TLabel").grid(
             row=t.grid_size()[1], column=0, columnspan=3, sticky="w", pady=(10, 0))
 
     def _build_time_tab(self, nb):
@@ -941,7 +1030,7 @@ class App(tk.Tk):
         ttk.Separator(t).grid(row=t.grid_size()[1], column=0, columnspan=3, sticky="ew", pady=8)
         ttk.Label(t, text=self.t("gpu_info"), wraplength=480, justify="left").grid(
             row=t.grid_size()[1], column=0, columnspan=3, sticky="w", pady=3)
-        ttk.Label(t, text=self.t("gpu_req"), wraplength=480, justify="left", foreground="gray").grid(
+        ttk.Label(t, text=self.t("gpu_req"), wraplength=480, justify="left", style="Hint.TLabel").grid(
             row=t.grid_size()[1], column=0, columnspan=3, sticky="w", pady=3)
         self.gpu_status_var.set(self.gpu_status_text())
 
@@ -963,6 +1052,144 @@ class App(tk.Tk):
             ttk.Entry(f, textvariable=self.vars[key]).pack(side="left", fill="x", expand=True)
             ttk.Button(f, text="…", width=3, command=lambda k=key: self.pick_tool(k)).pack(side="left", padx=4)
             self.row(t, self.t(lk), f)
+
+    # ----------------------------------------------------------------- tema
+    def resolve_theme(self):
+        mode = self.g("theme_mode")
+        if mode == "auto":
+            return detect_system_theme()
+        return "dark" if mode == "dark" else "light"
+
+    def on_theme_change(self):
+        """Kullanıcı temayı elle seçti: tercihi kaydet ve uygula.
+        'light'/'dark' seçiliyse sistem teması değişse bile sabit kalır."""
+        save_config({"theme_mode": self.g("theme_mode")})
+        self.apply_theme()
+
+    def _theme_tick(self):
+        # Yalnızca 'Otomatik' modda sistem temasını izler.
+        try:
+            if self.g("theme_mode") == "auto":
+                cur = detect_system_theme()
+                if cur != self.current_theme:
+                    self.apply_theme(cur)
+        except Exception:
+            pass
+        self.after(3000, self._theme_tick)
+
+    def apply_theme(self, resolved=None):
+        resolved = resolved or self.resolve_theme()
+        self.current_theme = resolved
+        p = THEMES[resolved]
+        st = self.style
+        native = os.name == "nt" and resolved == "light"
+        try:
+            st.theme_use("vista" if native else "clam")
+        except tk.TclError:
+            native = False
+            st.theme_use("clam")
+        self.configure(bg=p["bg"])
+        if not native:
+            self._style_clam(st, p)
+        st.configure("Hint.TLabel", foreground=p["hint"])
+        st.configure("Accent.TLabel", foreground=p["accent"])
+        st.configure("Warn.TLabel", foreground=p["warn"])
+        for name in ("preview", "log"):
+            tw = getattr(self, name, None)
+            if tw is not None and tw.winfo_exists():
+                tw.configure(bg=p["text_bg"], fg=p["fg"], insertbackground=p["fg"],
+                             selectbackground=p["sel"], selectforeground=p["sel_fg"],
+                             highlightthickness=1, highlightbackground=p["border"],
+                             highlightcolor=p["border"], relief="flat")
+        self._style_popdowns(self, p)
+        dark = resolved == "dark"
+        self._titlebar(dark)
+        self.after(80, lambda: self._titlebar(dark))
+
+    def _style_clam(self, st, p):
+        st.configure(".", background=p["bg"], foreground=p["fg"], fieldbackground=p["field"],
+                     troughcolor=p["trough"], bordercolor=p["border"], lightcolor=p["border"],
+                     darkcolor=p["border"], insertcolor=p["fg"], selectbackground=p["sel"],
+                     selectforeground=p["sel_fg"], focuscolor=p["border"])
+        st.map(".", foreground=[("disabled", p["dis"])])
+        for name in ("TFrame", "TLabel"):
+            st.configure(name, background=p["bg"])
+        st.configure("TLabel", foreground=p["fg"])
+        st.configure("TLabelframe", background=p["bg"], bordercolor=p["border"])
+        st.configure("TLabelframe.Label", background=p["bg"], foreground=p["fg"])
+        st.configure("TButton", background=p["btn"], foreground=p["fg"], bordercolor=p["border"],
+                     lightcolor=p["btn"], darkcolor=p["btn"], padding=(10, 4), anchor="center")
+        st.map("TButton",
+               background=[("disabled", p["bg"]), ("pressed", p["border"]), ("active", p["btn_hover"])],
+               foreground=[("disabled", p["dis"])])
+        st.configure("TCheckbutton", background=p["bg"], foreground=p["fg"],
+                     indicatorbackground=p["field"], indicatorforeground=p["fg"],
+                     upperbordercolor=p["border"], lowerbordercolor=p["border"])
+        st.map("TCheckbutton", background=[("active", p["bg"])],
+               indicatorbackground=[("disabled", p["trough"]), ("pressed", p["btn_hover"])],
+               foreground=[("disabled", p["dis"])])
+        for name in ("TEntry", "TSpinbox", "TCombobox"):
+            st.configure(name, fieldbackground=p["field"], foreground=p["fg"], insertcolor=p["fg"],
+                         bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
+                         arrowcolor=p["fg"], background=p["btn"])
+        st.map("TEntry", fieldbackground=[("disabled", p["trough"])], foreground=[("disabled", p["dis"])])
+        st.map("TSpinbox", fieldbackground=[("disabled", p["trough"])], foreground=[("disabled", p["dis"])],
+               background=[("active", p["btn_hover"])], arrowcolor=[("disabled", p["dis"])])
+        st.map("TCombobox",
+               fieldbackground=[("disabled", p["trough"]), ("readonly", p["field"])],
+               foreground=[("disabled", p["dis"])],
+               selectbackground=[("readonly", p["field"])], selectforeground=[("readonly", p["fg"])],
+               background=[("active", p["btn_hover"]), ("pressed", p["btn_hover"])],
+               arrowcolor=[("disabled", p["dis"])])
+        st.configure("TNotebook", background=p["bg"], bordercolor=p["border"],
+                     lightcolor=p["border"], darkcolor=p["border"])
+        st.configure("TNotebook.Tab", background=p["tab"], foreground=p["fg"],
+                     bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"])
+        st.map("TNotebook.Tab", background=[("selected", p["bg"]), ("active", p["btn_hover"])],
+               foreground=[("disabled", p["dis"])])
+        st.configure("Treeview", background=p["field"], fieldbackground=p["field"], foreground=p["fg"],
+                     bordercolor=p["border"], lightcolor=p["field"], darkcolor=p["field"])
+        st.map("Treeview", background=[("selected", p["sel"])], foreground=[("selected", p["sel_fg"])])
+        st.configure("Treeview.Heading", background=p["btn"], foreground=p["fg"], bordercolor=p["border"],
+                     lightcolor=p["btn"], darkcolor=p["btn"], relief="flat")
+        st.map("Treeview.Heading", background=[("active", p["btn_hover"])])
+        st.configure("TScrollbar", background=p["btn"], troughcolor=p["trough"], bordercolor=p["border"],
+                     arrowcolor=p["fg"], lightcolor=p["btn"], darkcolor=p["btn"])
+        st.map("TScrollbar", background=[("active", p["btn_hover"])])
+        st.configure("TProgressbar", background=p["sel"], troughcolor=p["trough"], bordercolor=p["border"],
+                     lightcolor=p["sel"], darkcolor=p["sel"])
+        st.configure("TSeparator", background=p["border"])
+        st.configure("TPanedwindow", background=p["bg"])
+
+    def _style_popdowns(self, widget, p):
+        """Combobox açılır listelerini (tk Listbox) temaya uydur."""
+        for c in widget.winfo_children():
+            if isinstance(c, ttk.Combobox):
+                try:
+                    pd = self.tk.eval(f"ttk::combobox::PopdownWindow {c}")
+                    self.tk.eval(
+                        f"{pd}.f.l configure -background {p['field']} -foreground {p['fg']} "
+                        f"-selectbackground {p['sel']} -selectforeground {p['sel_fg']} "
+                        f"-highlightthickness 0 -borderwidth 0")
+                except tk.TclError:
+                    pass
+            self._style_popdowns(c, p)
+
+    def _titlebar(self, dark):
+        """Windows'ta başlık çubuğunu da koyu/açık yap."""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            val = ctypes.c_int(1 if dark else 0)
+            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (yeni / eski sürüm)
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                    break
+        except Exception:
+            pass
 
     # ----------------------------------------------------- dil değiştirme
     def on_lang(self, _e=None):
